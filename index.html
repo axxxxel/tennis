@@ -1,0 +1,763 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  addDoc, 
+  deleteDoc, 
+  onSnapshot, 
+  query, 
+  where,
+  updateDoc,
+  writeBatch 
+} from 'firebase/firestore';
+import { setLogLevel } from 'firebase/firestore';
+
+// --- Firebase Konfiguration ---
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// --- Firebase Initialisierung ---
+let app;
+let auth;
+let db;
+try {
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+  setLogLevel('silent'); 
+} catch (e) {
+  console.error("Fehler bei der Firebase-Initialisierung:", e);
+}
+
+// --- Haupt-App-Komponente ---
+export default function App() {
+  const [userId, setUserId] = useState(null); // Auth User ID
+  const [myPlayerId, setMyPlayerId] = useState(null); // Verknüpfte Spieler-ID
+  
+  // Navigation & Modus
+  const [isAdminMode, setIsAdminMode] = useState(false); // Toggle für Admin/User
+  const [view, setView] = useState('calendar'); // 'calendar', 'profile', 'admin_players', 'admin_calendar'
+  
+  const [players, setPlayers] = useState([]);
+  const [sessions, setSessions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false); 
+
+  // --- Daten-Kollepfade ---
+  const playersCollectionPath = `artifacts/${appId}/public/data/tennisPlayers`;
+  const sessionsCollectionPath = `artifacts/${appId}/public/data/tennisSessions`;
+
+  // --- Authentifizierung ---
+  useEffect(() => {
+    if (!auth || !db) return;
+    const unsubAuth = onAuthStateChanged(auth, async (user) => {
+      let currentUserId = null;
+      if (user) {
+        currentUserId = user.uid;
+      } else {
+        const cred = initialAuthToken 
+          ? await signInWithCustomToken(auth, initialAuthToken).catch(() => signInAnonymously(auth))
+          : await signInAnonymously(auth);
+        currentUserId = cred.user.uid;
+      }
+      setUserId(currentUserId);
+
+      // Spielerprofil suchen
+      if (currentUserId) {
+        const q = query(collection(db, playersCollectionPath), where("userId", "==", currentUserId));
+        onSnapshot(q, (snapshot) => {
+          if (!snapshot.empty) setMyPlayerId(snapshot.docs[0].id);
+          else setMyPlayerId(null);
+        });
+      }
+    });
+    return () => unsubAuth();
+  }, [db, auth]);
+
+  // --- Daten laden ---
+  useEffect(() => {
+    if (!db) return;
+    setLoading(true);
+    const unsubPlayers = onSnapshot(query(collection(db, playersCollectionPath)), (snap) => {
+      setPlayers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      setLoading(false);
+    });
+    const unsubSessions = onSnapshot(query(collection(db, sessionsCollectionPath)), (snap) => {
+      const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      data.sort((a, b) => new Date(a.date) - new Date(b.date));
+      setSessions(data);
+    });
+    return () => { unsubPlayers(); unsubSessions(); };
+  }, [db]);
+
+  // --- LOGIK: Admin Aktionen ---
+
+  const addPlayer = async (data) => {
+    if (!db) return;
+    await addDoc(collection(db, playersCollectionPath), { ...data, status: 'active', userId: null });
+  };
+
+  const deletePlayer = async (id) => {
+    if (!db) return;
+    // window.confirm entfernt, da in Sandbox oft blockiert
+    try {
+      await deleteDoc(doc(db, playersCollectionPath, id));
+    } catch (e) {
+      console.error("Delete Error", e);
+      setError("Konnte Spieler nicht löschen: " + e.message);
+    }
+  };
+
+  const addSessionSeries = async (dayOfWeek, time1, time2, startDate, endDate, activePlayers) => {
+    if (!db) return;
+    setIsSubmitting(true);
+    try {
+      // Rotation Logic
+      let currentPlayersList = [...activePlayers].sort(() => 0.5 - Math.random());
+      const spots1 = 4; 
+      const spots2 = time2 ? 4 : 0;
+      const totalSpots = spots1 + spots2;
+      
+      const start = new Date(startDate + 'T12:00:00'); 
+      const end = new Date(endDate + 'T12:00:00');
+      const dayNum = parseInt(dayOfWeek, 10);
+      let current = new Date(start.getTime());
+      // Zum ersten korrekten Wochentag
+      current.setDate(current.getDate() + (dayNum - current.getDay() + 7) % 7);
+
+      const batch = writeBatch(db);
+      let opCount = 0; // Firestore Batches haben Limit von 500, hier vereinfacht
+
+      while (current <= end) {
+        const sessionDate = current.toISOString().split('T')[0];
+        let weeklyShuffled = [...currentPlayersList].sort(() => 0.5 - Math.random());
+        
+        const p1 = [], p2 = [], wl = [];
+        weeklyShuffled.forEach((p, i) => {
+          if (i < totalSpots) {
+            if (time2) {
+              if (i % 2 === 0) p1.length < spots1 ? p1.push(p.id) : p2.push(p.id);
+              else p2.length < spots2 ? p2.push(p.id) : p1.push(p.id);
+            } else p1.push(p.id);
+          } else wl.push(p.id);
+        });
+
+        const ref1 = doc(collection(db, sessionsCollectionPath));
+        batch.set(ref1, { date: sessionDate, time: time1, courtCount: 1, participants: p1, waitlist: wl });
+        opCount++;
+
+        if (time2) {
+          const ref2 = doc(collection(db, sessionsCollectionPath));
+          batch.set(ref2, { date: sessionDate, time: time2, courtCount: 1, participants: p2, waitlist: [] });
+          opCount++;
+        }
+
+        // Rotation
+        const satOut = currentPlayersList.slice(totalSpots);
+        const played = currentPlayersList.slice(0, totalSpots);
+        currentPlayersList = [...satOut, ...played];
+        
+        current.setDate(current.getDate() + 7);
+      }
+      await batch.commit();
+    } catch (e) {
+      console.error(e);
+      setError("Fehler beim Erstellen: " + e.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const deleteSession = async (id) => {
+    if (!db) return;
+    // window.confirm entfernt
+    try {
+      await deleteDoc(doc(db, sessionsCollectionPath, id));
+    } catch (e) {
+      console.error("Delete Error", e);
+      setError("Konnte Termin nicht löschen.");
+    }
+  };
+
+  // --- LOGIK: User Aktionen ---
+
+  const updateMyProfile = async (id, data) => {
+    if (!db) return;
+    const playerRef = doc(db, playersCollectionPath, id);
+    
+    // Check auf Inaktivität -> Automatische Absagen
+    if (data.inactiveStart && data.inactiveEnd) {
+       const start = new Date(data.inactiveStart);
+       const end = new Date(data.inactiveEnd);
+       
+       // Wir müssen durch alle Sessions loopen und den Spieler rauswerfen
+       const sessionsToCancel = sessions.filter(s => {
+         const d = new Date(s.date);
+         return d >= start && d <= end && s.participants.includes(id);
+       });
+       
+       // Absagen triggern (Parallel)
+       sessionsToCancel.forEach(s => {
+          // Wir suchen die Sessions dieses Tages für die Wartelisten-Logik
+          const daySessions = sessions.filter(ds => ds.date === s.date);
+          cancelSession(s, daySessions, id);
+       });
+    }
+
+    await updateDoc(playerRef, data);
+  };
+
+  const cancelSession = async (session, daySessions, playerId) => {
+    if (!db) return;
+    try {
+      const batch = writeBatch(db);
+      
+      // Warteliste finden (immer Session 1 des Tages)
+      const sortedDay = [...daySessions].sort((a,b) => a.time.localeCompare(b.time));
+      const wlSession = sortedDay[0];
+      const wlRef = doc(db, sessionsCollectionPath, wlSession.id);
+      
+      const currentWL = wlSession.waitlist || [];
+      const sessionRef = doc(db, sessionsCollectionPath, session.id);
+      let newParticipants = session.participants.filter(pid => pid !== playerId);
+
+      // Nachrücken
+      let newWL = [...currentWL];
+      if (currentWL.length > 0) {
+        const nextInLine = currentWL[0];
+        newWL = currentWL.slice(1);
+        newParticipants.push(nextInLine);
+      }
+
+      // Falls die abgesagte Session auch die WL Session ist, müssen wir vorsichtig sein
+      if (wlSession.id === session.id) {
+         batch.update(sessionRef, { participants: newParticipants, waitlist: newWL });
+      } else {
+         batch.update(sessionRef, { participants: newParticipants });
+         batch.update(wlRef, { waitlist: newWL });
+      }
+      
+      await batch.commit();
+    } catch (e) {
+      console.error(e);
+      setError("Fehler beim Absagen.");
+    }
+  };
+
+  const requestTrade = async (session) => {
+    if (!db || !myPlayerId) return;
+    await updateDoc(doc(db, sessionsCollectionPath, session.id), {
+      tradeRequestedBy: myPlayerId
+    });
+  };
+
+  const acceptTrade = async (session) => {
+    if (!db || !myPlayerId) return;
+    const oldPlayer = session.tradeRequestedBy;
+    if (!oldPlayer) return;
+
+    // Tausch: Alter raus, Neuer (Ich) rein. Trade Flag weg.
+    const newParticipants = session.participants.map(p => p === oldPlayer ? myPlayerId : p);
+    
+    await updateDoc(doc(db, sessionsCollectionPath, session.id), {
+      participants: newParticipants,
+      tradeRequestedBy: null // Reset
+    });
+  };
+
+  // --- Render ---
+  return (
+    <div className="flex flex-col h-screen bg-gray-50 text-gray-800 font-sans">
+      {/* Header */}
+      <header className="bg-white shadow-sm z-10">
+        <div className="container mx-auto px-4 py-3 flex justify-between items-center">
+          <div className="flex items-center space-x-2">
+             <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold">T</div>
+             <span className="font-bold text-lg hidden md:block">Tennis Manager</span>
+          </div>
+          
+          <div className="flex items-center bg-gray-100 rounded-full p-1">
+            <button 
+              onClick={() => { setIsAdminMode(false); setView('calendar'); }}
+              className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${!isAdminMode ? 'bg-white shadow text-blue-700' : 'text-gray-500'}`}
+            >
+              Spieler
+            </button>
+            <button 
+              onClick={() => { setIsAdminMode(true); setView('admin_calendar'); }}
+              className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${isAdminMode ? 'bg-white shadow text-red-600' : 'text-gray-500'}`}
+            >
+              Admin
+            </button>
+          </div>
+        </div>
+        
+        {/* Sub-Navigation */}
+        <div className="border-t border-gray-100">
+           <div className="container mx-auto px-4">
+             <div className="flex space-x-6 overflow-x-auto">
+               {!isAdminMode ? (
+                 <>
+                   <NavBtn active={view === 'calendar'} onClick={() => setView('calendar')}>Mein Kalender</NavBtn>
+                   <NavBtn active={view === 'profile'} onClick={() => setView('profile')}>Mein Profil</NavBtn>
+                 </>
+               ) : (
+                 <>
+                   <NavBtn active={view === 'admin_calendar'} onClick={() => setView('admin_calendar')}>Serien & Termine</NavBtn>
+                   <NavBtn active={view === 'admin_players'} onClick={() => setView('admin_players')}>Spieler verwalten</NavBtn>
+                 </>
+               )}
+             </div>
+           </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-y-auto p-4 container mx-auto max-w-5xl">
+        {error && <div className="bg-red-100 text-red-700 p-3 rounded mb-4">{error}</div>}
+        {loading && <div className="text-center py-10 text-gray-500">Lade Daten...</div>}
+
+        {!loading && (
+          <>
+            {/* --- USER VIEWS --- */}
+            {!isAdminMode && view === 'calendar' && (
+              <UserCalendarView 
+                sessions={sessions} players={players} myPlayerId={myPlayerId} 
+                cancelSession={cancelSession} requestTrade={requestTrade} acceptTrade={acceptTrade}
+              />
+            )}
+            {!isAdminMode && view === 'profile' && (
+              <UserProfileView 
+                players={players} myPlayerId={myPlayerId} userId={userId} 
+                updateProfile={updateMyProfile} claimProfile={(pid) => updateDoc(doc(db, playersCollectionPath, pid), { userId })}
+              />
+            )}
+
+            {/* --- ADMIN VIEWS --- */}
+            {isAdminMode && view === 'admin_players' && (
+              <AdminPlayerView players={players} addPlayer={addPlayer} deletePlayer={deletePlayer} />
+            )}
+            {isAdminMode && view === 'admin_calendar' && (
+              <AdminCalendarView 
+                sessions={sessions} players={players} 
+                addSessionSeries={addSessionSeries} deleteSession={deleteSession} isSubmitting={isSubmitting}
+              />
+            )}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+// --- SUB-COMPONENTS ---
+
+function NavBtn({ children, active, onClick }) {
+  return (
+    <button 
+      onClick={onClick}
+      className={`py-3 text-sm font-medium border-b-2 whitespace-nowrap ${active ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ----------------------------------------------------------------------
+// USER AREA
+// ----------------------------------------------------------------------
+
+function UserCalendarView({ sessions, players, myPlayerId, cancelSession, requestTrade, acceptTrade }) {
+  const playerMap = useMemo(() => players.reduce((acc, p) => ({...acc, [p.id]: p}), {}), [players]);
+  
+  // Gruppieren
+  const grouped = useMemo(() => {
+    const g = {};
+    sessions.forEach(s => { if (!g[s.date]) g[s.date] = []; g[s.date].push(s); });
+    Object.keys(g).forEach(d => g[d].sort((a,b) => a.time.localeCompare(b.time)));
+    return g;
+  }, [sessions]);
+  
+  const dates = Object.keys(grouped).sort((a,b) => new Date(a) - new Date(b));
+
+  if (!myPlayerId) return <div className="text-center p-8 bg-white rounded shadow">Bitte wähle zuerst dein Profil im Reiter "Mein Profil"!</div>;
+
+  return (
+    <div className="space-y-6">
+      {dates.map(date => (
+        <DayCardUser 
+          key={date} date={date} sessions={grouped[date]} 
+          playerMap={playerMap} myPlayerId={myPlayerId}
+          cancelSession={(s) => cancelSession(s, grouped[date], myPlayerId)}
+          requestTrade={requestTrade}
+          acceptTrade={acceptTrade}
+        />
+      ))}
+      {dates.length === 0 && <p className="text-center text-gray-500">Keine Termine.</p>}
+    </div>
+  );
+}
+
+function DayCardUser({ date, sessions, playerMap, myPlayerId, cancelSession, requestTrade, acceptTrade }) {
+  const wlSession = sessions[0];
+  const waitlist = wlSession?.waitlist || [];
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+      <div className="bg-gray-50 px-4 py-2 border-b border-gray-100 flex justify-between items-center">
+        <h3 className="font-semibold text-gray-700">
+          {new Date(date).toLocaleDateString('de-DE', { weekday: 'long', day: '2-digit', month: '2-digit' })}
+        </h3>
+        <span className="text-xs text-gray-400">{sessions.length} Termine</span>
+      </div>
+      
+      <div className="divide-y divide-gray-100">
+        {sessions.map(s => {
+          const amIPlaying = s.participants.includes(myPlayerId);
+          const isTradeRequested = !!s.tradeRequestedBy;
+          const requestingPlayer = isTradeRequested ? playerMap[s.tradeRequestedBy] : null;
+
+          return (
+            <div key={s.id} className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="flex-1">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="font-bold text-blue-700 w-16">{s.time}</span>
+                  {isTradeRequested && (
+                    <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full flex items-center">
+                      🔄 Tausch-Anfrage von {requestingPlayer?.name || '?'}
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {s.participants.map(pid => (
+                    <PlayerBadge key={pid} player={playerMap[pid]} isMe={pid === myPlayerId} />
+                  ))}
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="flex items-center gap-2">
+                {amIPlaying && !isTradeRequested && (
+                  <>
+                    <button onClick={() => requestTrade(s)} className="text-xs px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md transition">
+                      🔄 Tauschen
+                    </button>
+                    <button onClick={() => cancelSession(s)} className="text-xs px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-md transition">
+                      Absagen
+                    </button>
+                  </>
+                )}
+                {amIPlaying && isTradeRequested && s.tradeRequestedBy === myPlayerId && (
+                  <span className="text-xs text-gray-400 italic">Warte auf Tauschpartner...</span>
+                )}
+                {!amIPlaying && isTradeRequested && s.tradeRequestedBy !== myPlayerId && (
+                  <button onClick={() => acceptTrade(s)} className="text-xs px-3 py-1.5 bg-green-100 hover:bg-green-200 text-green-700 rounded-md font-medium transition">
+                    Tausch annehmen
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {waitlist.length > 0 && (
+           <div className="p-3 bg-yellow-50/50 text-sm">
+             <span className="font-medium text-yellow-800 mr-2">Warteliste:</span>
+             {waitlist.map((pid, i) => (
+               <span key={pid} className="text-yellow-700">{playerMap[pid]?.name}{i < waitlist.length - 1 ? ', ' : ''}</span>
+             ))}
+           </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UserProfileView({ players, myPlayerId, userId, updateProfile, claimProfile }) {
+  const myProfile = players.find(p => p.id === myPlayerId);
+  const [editMode, setEditMode] = useState(false);
+  const [formData, setFormData] = useState({});
+
+  useEffect(() => {
+    if (myProfile) setFormData(myProfile);
+  }, [myProfile]);
+
+  if (!myPlayerId) {
+    // Profilauswahl
+    const availablePlayers = players.filter(p => !p.userId);
+    return (
+      <div className="bg-white p-6 rounded-xl shadow-sm">
+        <h2 className="text-xl font-bold mb-4">Wer bist du?</h2>
+        <p className="text-gray-600 mb-6">Bitte wähle dein Profil aus der Liste, um die App zu nutzen.</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+          {availablePlayers.map(p => (
+             <button key={p.id} onClick={() => claimProfile(p.id)} className="flex items-center gap-3 p-3 border rounded-lg hover:border-blue-500 hover:bg-blue-50 transition text-left">
+               <img src={p.avatarUrl} className="w-10 h-10 rounded-full bg-gray-200" />
+               <span className="font-medium">{p.name}</span>
+             </button>
+          ))}
+          {availablePlayers.length === 0 && <p className="text-gray-500 col-span-3">Keine freien Profile verfügbar. Bitte Admin kontaktieren.</p>}
+        </div>
+      </div>
+    );
+  }
+
+  // Profilanzeige / Edit
+  return (
+    <div className="max-w-xl mx-auto bg-white p-6 rounded-xl shadow-sm">
+      <div className="flex justify-between items-start mb-6">
+        <h2 className="text-2xl font-bold text-gray-800">Mein Profil</h2>
+        <button onClick={() => setEditMode(!editMode)} className="text-blue-600 text-sm font-medium hover:underline">
+          {editMode ? 'Abbrechen' : 'Bearbeiten'}
+        </button>
+      </div>
+
+      <div className="flex flex-col items-center mb-8">
+        <img src={formData.avatarUrl} className="w-24 h-24 rounded-full bg-gray-100 mb-3" />
+        <h3 className="text-xl font-semibold">{formData.name}</h3>
+        <p className="text-green-600 text-sm bg-green-50 px-2 py-0.5 rounded-full">Aktivierter Account</p>
+      </div>
+
+      <div className="space-y-4">
+        <div className="grid grid-cols-1 gap-4">
+           <div>
+             <label className="block text-sm text-gray-500 mb-1">E-Mail</label>
+             {editMode ? (
+               <input 
+                 className="w-full border p-2 rounded" 
+                 value={formData.email || ''} 
+                 onChange={e => setFormData({...formData, email: e.target.value})}
+               />
+             ) : <div className="text-gray-800">{formData.email || '-'}</div>}
+           </div>
+           <div>
+             <label className="block text-sm text-gray-500 mb-1">Telefon</label>
+             {editMode ? (
+               <input 
+                 className="w-full border p-2 rounded" 
+                 value={formData.phone || ''} 
+                 onChange={e => setFormData({...formData, phone: e.target.value})}
+               />
+             ) : <div className="text-gray-800">{formData.phone || '-'}</div>}
+           </div>
+        </div>
+
+        <div className="border-t pt-4 mt-4">
+          <h4 className="font-semibold mb-3 text-gray-700">Abwesenheit & Urlaub</h4>
+          <p className="text-xs text-gray-500 mb-3">
+             Wenn du hier einen Zeitraum einträgst, werden <strong>alle deine Spiele</strong> in diesem Zeitraum automatisch abgesagt und die Warteliste rückt nach.
+          </p>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-gray-500 mb-1">Von</label>
+              <input 
+                 type="date" 
+                 disabled={!editMode}
+                 className="w-full border p-2 rounded disabled:bg-gray-50"
+                 value={formData.inactiveStart || ''} 
+                 onChange={e => setFormData({...formData, inactiveStart: e.target.value})}
+               />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-500 mb-1">Bis</label>
+              <input 
+                 type="date" 
+                 disabled={!editMode}
+                 className="w-full border p-2 rounded disabled:bg-gray-50"
+                 value={formData.inactiveEnd || ''} 
+                 onChange={e => setFormData({...formData, inactiveEnd: e.target.value})}
+               />
+            </div>
+          </div>
+        </div>
+
+        {editMode && (
+          <button 
+            onClick={() => { updateProfile(myPlayerId, formData); setEditMode(false); }}
+            className="w-full bg-blue-600 text-white py-2 rounded-lg font-medium hover:bg-blue-700 mt-4"
+          >
+            Speichern & Übernehmen
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------
+// ADMIN AREA
+// ----------------------------------------------------------------------
+
+function AdminPlayerView({ players, addPlayer, deletePlayer }) {
+  const [newName, setNewName] = useState('');
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        <h3 className="text-lg font-bold mb-4">Neuen Spieler anlegen</h3>
+        <div className="flex gap-2">
+          <input 
+            className="flex-1 border p-2 rounded-lg" 
+            placeholder="Name" 
+            value={newName} 
+            onChange={e => setNewName(e.target.value)}
+          />
+          <button 
+            onClick={() => { if(newName) { addPlayer({ name: newName }); setNewName(''); }}}
+            className="bg-green-600 text-white px-6 rounded-lg font-medium hover:bg-green-700"
+          >
+            Anlegen
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+        <table className="w-full text-left">
+          <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
+            <tr>
+              <th className="px-6 py-3">Name</th>
+              <th className="px-6 py-3">Status</th>
+              <th className="px-6 py-3 text-right">Aktion</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {players.map(p => (
+              <tr key={p.id} className="hover:bg-gray-50">
+                <td className="px-6 py-4 font-medium flex items-center gap-3">
+                   <img src={p.avatarUrl} className="w-8 h-8 rounded-full bg-gray-200" />
+                   {p.name}
+                   {p.userId && <span className="text-xs bg-green-100 text-green-700 px-1.5 rounded">Verknüpft</span>}
+                </td>
+                <td className="px-6 py-4 text-sm">
+                  {p.status}
+                  {p.inactiveStart && <div className="text-xs text-orange-600">Urlaub bis {p.inactiveEnd}</div>}
+                </td>
+                <td className="px-6 py-4 text-right">
+                  <DeleteWithConfirmButton onDelete={() => deletePlayer(p.id)} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Kleine Hilfskomponente für sicheres Löschen
+function DeleteWithConfirmButton({ onDelete }) {
+  const [confirming, setConfirming] = useState(false);
+
+  if (confirming) {
+    return (
+      <div className="flex gap-2 justify-end items-center">
+        <span className="text-xs text-red-600 font-bold">Sicher?</span>
+        <button onClick={onDelete} className="bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded text-xs">
+          Ja
+        </button>
+        <button onClick={() => setConfirming(false)} className="text-gray-500 hover:text-gray-700 text-xs">
+          Nein
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <button onClick={() => setConfirming(true)} className="text-red-500 hover:bg-red-50 px-3 py-1 rounded text-sm transition-colors">
+      Löschen
+    </button>
+  );
+}
+
+function AdminCalendarView({ sessions, players, addSessionSeries, deleteSession, isSubmitting }) {
+  const [form, setForm] = useState({ 
+    day: '1', time1: '18:00', time2: '19:00', start: new Date().toISOString().split('T')[0], end: '' 
+  });
+  
+  const activePlayers = players.filter(p => p.status === 'active');
+  const grouped = useMemo(() => {
+     const g = {};
+     sessions.forEach(s => { if (!g[s.date]) g[s.date] = []; g[s.date].push(s); });
+     return g;
+  }, [sessions]);
+  const dates = Object.keys(grouped).sort((a,b) => new Date(a) - new Date(b));
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="lg:col-span-1 space-y-6">
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+           <h3 className="text-lg font-bold mb-4">Serie erstellen</h3>
+           <div className="space-y-3">
+             <select className="w-full border p-2 rounded" value={form.day} onChange={e => setForm({...form, day: e.target.value})}>
+               <option value="1">Montag</option><option value="2">Dienstag</option><option value="3">Mittwoch</option>
+               <option value="4">Donnerstag</option><option value="5">Freitag</option><option value="6">Samstag</option>
+               <option value="0">Sonntag</option>
+             </select>
+             <div className="flex gap-2">
+               <input type="time" className="w-full border p-2 rounded" value={form.time1} onChange={e => setForm({...form, time1: e.target.value})} />
+               <input type="time" className="w-full border p-2 rounded" value={form.time2} onChange={e => setForm({...form, time2: e.target.value})} />
+             </div>
+             <div className="grid grid-cols-2 gap-2">
+               <input type="date" className="border p-2 rounded" value={form.start} onChange={e => setForm({...form, start: e.target.value})} />
+               <input type="date" className="border p-2 rounded" value={form.end} onChange={e => setForm({...form, end: e.target.value})} />
+             </div>
+             <button 
+               disabled={isSubmitting || !form.end}
+               onClick={() => addSessionSeries(form.day, form.time1, form.time2, form.start, form.end, activePlayers)}
+               className="w-full bg-blue-600 text-white py-2 rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300"
+             >
+               {isSubmitting ? 'Generiere...' : `Serie generieren (${activePlayers.length} Spieler)`}
+             </button>
+           </div>
+        </div>
+      </div>
+
+      <div className="lg:col-span-2">
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+          <div className="bg-gray-50 px-4 py-3 border-b font-medium text-gray-700">Geplante Termine</div>
+          <div className="max-h-[600px] overflow-y-auto divide-y divide-gray-100">
+            {dates.map(d => (
+              <div key={d} className="p-4 flex items-center justify-between hover:bg-gray-50">
+                 <div>
+                   <div className="font-medium text-gray-900">{new Date(d).toLocaleDateString('de-DE')}</div>
+                   <div className="text-sm text-gray-500">
+                     {grouped[d].map(s => s.time).join(', ')} Uhr ({grouped[d].length} Slots)
+                   </div>
+                 </div>
+                 <div className="flex gap-2">
+                    {grouped[d].map(s => (
+                       <button key={s.id} onClick={() => deleteSession(s.id)} className="text-xs bg-red-100 text-red-700 px-2 py-1 rounded">
+                         Del {s.time}
+                       </button>
+                    ))}
+                 </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- Helpers ---
+
+function PlayerBadge({ player, isMe }) {
+  if (!player) return <span className="bg-gray-100 text-gray-500 text-xs px-2 py-1 rounded-full">?</span>;
+  return (
+    <div className={`flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-full text-xs font-medium border ${isMe ? 'bg-green-50 text-green-800 border-green-200' : 'bg-white text-gray-700 border-gray-200'}`}>
+      <img src={player.avatarUrl} className="w-4 h-4 rounded-full bg-gray-200" />
+      {player.name}
+    </div>
+  );
+}
